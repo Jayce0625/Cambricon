@@ -1,0 +1,66 @@
+# Copyright (C) [2020-2023] The Cambricon Authors. All Rights Reserved.   
+# model configuration for caffe.
+
+resnet50:
+  resize_size: [256, 256]
+  center_crop_size: [224, 224]
+  need_bgr2rgb: False 
+  need_transpose: True
+  need_normalize: False
+  mean: [103.94,116.78,123.68]
+  std: [1.0,1.0,1.0]
+
+vgg16:
+  resize_size: [256, 256]
+  center_crop_size: [224, 224]
+  need_bgr2rgb: False 
+  need_transpose: True
+  need_normalize: False
+  mean: [103.939, 116.779, 123.68]
+  std: [1.0,1.0,1.0]
+
+inceptionv3:
+  resize_size: [299,299]
+  center_crop_size: [299,299]
+  need_bgr2rgb: False 
+  need_transpose: True
+  need_normalize: False
+  mean: [128.0,128.0,128.0]
+  std: [0.0078125,0.0078125,0.0078125]
+
+mobilenet_v2:
+  resize_size: [256, 256]
+  center_crop_size: [224, 224]
+  need_bgr2rgb: False 
+  need_transpose: True
+  need_normalize: False
+  mean: [103.94, 116.78, 123.68]
+  std: [0.017,0.017,0.017]
+
+squeezenet_v1.1:
+  resize_size: [256, 256]
+  center_crop_size: [227,227]
+  need_bgr2rgb: False 
+  need_transpose: True
+  need_normalize: False
+  mean: [103.939, 116.779, 123.68]
+  std: [1.0,1.0,1.0]
+
+senet:
+  resize_size: [256, 256]
+  center_crop_size: [224, 224]
+  need_bgr2rgb: False 
+  need_transpose: True
+  need_normalize: False
+  mean: [0.0,0.0,0.0]
+  std: [1.0,1.0,1.0]
+
+yolov3:
+  resize_size: [416, 416]
+  center_crop_size: [416, 416]
+  need_bgr2rgb: false 
+  need_transpose: true
+  need_normalize: false
+  mean: [0.0,0.0,0.0]
+  std: [0.00392,0.00392,0.00392]
+

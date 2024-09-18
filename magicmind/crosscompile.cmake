@@ -1,0 +1,13 @@
+SET(CMAKE_SYSTEM_NAME Linux)
+if (EXISTS $ENV{TOOLCHAIN_PATH})
+  if (EXISTS $ENV{TOOLCHAIN_PATH}/bin/aarch64-linux-gnu-gcc)
+    SET(CMAKE_C_COMPILER "$ENV{TOOLCHAIN_PATH}/bin/aarch64-linux-gnu-gcc")
+    SET(CMAKE_CXX_COMPILER "$ENV{TOOLCHAIN_PATH}/bin/aarch64-linux-gnu-g++")
+  elseif(EXISTS $ENV{TOOLCHAIN_PATH}/bin/aarch64-buildroot-linux-gnu-gcc)
+    SET(CMAKE_C_COMPILER "$ENV{TOOLCHAIN_PATH}/bin/aarch64-buildroot-linux-gnu-gcc")
+    SET(CMAKE_CXX_COMPILER "$ENV{TOOLCHAIN_PATH}/bin/aarch64-buildroot-linux-gnu-g++")
+  endif()
+else()
+  message(FATAL_ERROR "TOOLCHAIN_PATH cannot be found for aarch64 compile.")
+endif()
+

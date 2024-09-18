@@ -1,0 +1,152 @@
+/*************************************************************************
+ * Copyright (C) [2020-2023] by Cambricon, Inc.
+ *************************************************************************/
+#include <cstring>
+#include "bang.h"
+#include "mlu.h"
+#include "cn_api.h"
+#include "plugin_resize_yuv_to_rgba_kernel.h"
+#include "plugin_resize_yuv_to_rgba_mlu300_kernel.h"
+#include "plugin_resize_yuv_to_rgba_mlu200_kernel.h"
+#include "plugin_resize_yuv_to_rgba_macro.h"
+#define DEVICE_NAME_LENGTH 64
+#define DEVICE_TYPE_NUM 8
+struct DeviceName {
+  char device_name[DEVICE_NAME_LENGTH];
+  int device_name_id;
+};
+
+static struct DeviceName device_name_table[DEVICE_TYPE_NUM] = {
+    {"CE3226", 5},     {"MLU370", 6}, {"MLU365-D2", 7}};
+
+int devStrToInt(const char *device_name) {
+  for (int i = 0; i < DEVICE_TYPE_NUM; i++) {
+    struct DeviceName *name = &device_name_table[i];
+    if (0 == strncmp(name->device_name, device_name, strlen(name->device_name))) {
+      return name->device_name_id;
+    }
+  }
+  return -1;
+}
+
+static int PolicyFunc(int64_t batch_size,
+                      const int32_t *dst_rois,
+                      cnrtDim3_t *k_dim,
+                      cnrtFunctionType_t *k_type,
+                      bool *is_batch_split,
+                      char *device_name) {
+  // Get device info and user-determined task info
+  CNdev mlu_dev;
+  CNcontext drv_ctx;
+  CNctxConfigParam ctx_conf_param;
+  int32_t core_num_per_cluster = 0;
+
+  if (CN_SUCCESS != cnCtxGetDevice(&mlu_dev)) {
+    printf("[ResizeYuvToRgbaEnqueue] Get mlu device type in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS != cnDeviceGetName(device_name, DEVICE_NAME_LENGTH, mlu_dev)) {
+    printf("[ResizeYuvToRgbaEnqueue] Get mlu device name in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS != cnDeviceGetAttribute(&core_num_per_cluster,
+                                         CN_DEVICE_ATTRIBUTE_MAX_CORE_COUNT_PER_CLUSTER, mlu_dev)) {
+    printf(
+        "[ResizeYuvToRgbaEnqueue] Get mlu device max core count per cluster in PolicyFunc "
+        "failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS != cnCtxGetCurrent(&drv_ctx)) {
+    printf("[ResizeYuvToRgbaEnqueue] Get mlu drv context in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS !=
+      cnGetCtxConfigParam(drv_ctx, CN_CTX_CONFIG_VISIBLE_CLUSTER_NUM, &ctx_conf_param)) {
+    printf("[ResizeYuvToRgbaEnqueue] Get mlu drv visible cluster num in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  // Maybe helpful but not used.
+  // int32_t max_cluster_count = 0;
+  // if (CN_SUCCESS !=
+  //     cnDeviceGetAttribute(&max_cluster_count, CN_DEVICE_ATTRIBUTE_MAX_CLUSTER_COUNT, mlu_dev)) {
+  //   printf("[ResizeYuvToRgbaEnqueue] Get mlu device cluster num in PolicyFunc failed.\n");
+  //   return -1;
+  // }
+
+  *k_type = CNRT_FUNC_TYPE_UNION1;
+
+  uint32_t core_dim = core_num_per_cluster;
+  uint32_t num_union = ctx_conf_param.visibleClusterNumber;
+
+  k_dim->x = core_dim;
+  k_dim->y = num_union;
+  k_dim->z = 1;
+
+  // policy strategy by test results
+  if (batch_size == 1) {
+    if (num_union == 1) {
+      *is_batch_split = true;
+      k_dim->y = 1;
+    } else {
+      // when satisfying the following conditions, hw split is preferred by test results
+      // dst_rois only has 4 elements when batct_size == 1, i.e., x y w h.
+      *is_batch_split = false;
+      if (dst_rois[3] <= 60) {
+        k_dim->y = fmin(num_union, 3);
+      } else if (dst_rois[3] <= 100) {
+        k_dim->y = fmin(num_union, 4);
+      } else if (dst_rois[3] <= 200) {
+        k_dim->y = fmin(num_union, 5);
+      } else {
+        k_dim->y = fmin(num_union, 6);
+      }
+    }
+  } else {
+    *is_batch_split = true;
+    k_dim->y = fmin(num_union, batch_size);
+  }
+
+  return 0;
+}
+
+void ResizeYuvToRgbaEnqueue(cnrtQueue_t queue,
+                            void **dst_gdram,
+                            void **input_y,
+                            void **input_uv,
+                            void *shape_gdram,
+                            void **mask_gdram,
+                            void **weight_gdram,
+                            void *fill_color_gdram,
+                            void *yuv_filter_gdram,
+                            void *yuv_bias_gdram,
+                            void **expand_filter_gdram,
+                            int32_t *dst_rois,
+                            int batch_num,
+                            int dst_channel) {
+  cnrtDim3_t dim;
+  cnrtFunctionType_t ktype;
+  char device_name[DEVICE_NAME_LENGTH] = "";
+  bool is_batch_split = false;
+  if (PolicyFunc(batch_num, dst_rois, &dim, &ktype, &is_batch_split, device_name) != 0) {
+    printf("[ResizeYuvToRgbaEnqueue]: PolicyFunc run failed.\n");
+    return;
+  }
+
+  int dev_id = devStrToInt(device_name);
+  if (dev_id >= 5 && dev_id <= 7) {  // MLU300 series
+    MLUUnion1KernelResizeConvert300<<<dim, ktype, queue>>>(
+        (void **)input_y, (void **)input_uv, (void **)dst_gdram, fill_color_gdram, batch_num,
+        dst_channel, (void *)yuv_filter_gdram, (void *)yuv_bias_gdram, (void *)shape_gdram,
+        (void **)mask_gdram, (void **)weight_gdram, (void **)expand_filter_gdram, is_batch_split);
+  } else if (dev_id >= 0 && dev_id <= 4) {  // MLU200 series
+    MLUUnion1KernelResizeConvert200<<<dim, ktype, queue>>>(
+        (void **)input_y, (void **)input_uv, (void **)dst_gdram, fill_color_gdram, batch_num,
+        dst_channel, (void *)yuv_filter_gdram, (void *)yuv_bias_gdram, (void *)shape_gdram,
+        (void **)mask_gdram, (void **)weight_gdram, (void **)expand_filter_gdram);
+  }
+}

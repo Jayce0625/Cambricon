@@ -1,0 +1,530 @@
+/*************************************************************************
+ * Copyright (C) [2020-2023] by Cambricon, Inc.
+ *************************************************************************/
+#include "bang.h"
+#include "cnnl.h"
+#include "mlu.h"
+#include "plugin_crop_and_resize_kernel.h"
+#include "cn_api.h"
+
+#define MAX_SRCNUM 8192
+#define BUFFER_SIZE (__MLU_NRAM_SIZE__ * 500)
+#define PAD_UP(x, y) ((x) / (y) + (int)((x) % (y) > 0)) * (y)
+#define CI 64
+#define CO 256
+#define LT_NUM 64
+#define PAD_SIZE 64
+#define MAX_ROI_NUM 64
+/*------------------------------ HELP FUNCTIONS ------------------------------*/
+// load syn & bias from gdram if needed
+// mult: the multipiler used in upscaling mode
+__mlu_func__ void loadFilters(half *cpySyn, half *buffer, int mult) {
+  // Load weights if need src expansion
+  if (mult > 1) {
+    half *IdenCI = buffer;
+    half *cpyFilter = IdenCI + CI * CI;
+    __bang_write_zero(IdenCI, CI * CI);
+    for (int i = 0; i < CI; i++) {
+      ((int16_t *)IdenCI)[i * CI + i] = 1;
+    }
+
+    int kernelNum = mult * CI;
+    int kernelNumPerLT = kernelNum / LT_NUM;
+    for (int kernelId = 0; kernelId < kernelNum; kernelId++) {
+      int ltId = kernelId % LT_NUM;
+      int ltOffset = kernelId / LT_NUM;
+      int filterOffset = ltId * kernelNumPerLT + ltOffset;
+      int IdenOffset = 4 * (kernelId / (4 * mult)) + (kernelId % 4);
+      __memcpy(cpyFilter + filterOffset * CI, IdenCI + IdenOffset * CI, CI * sizeof(half),
+               NRAM2NRAM);
+    }
+    __memcpy(cpySyn, cpyFilter, CI * CI * mult * sizeof(half), NRAM2WRAM);
+  }
+}
+
+// [Module 1]::genMaskAndWeights
+// generate mask && weightX to select proper point column-wisely
+// using the formula posSrc = (posDst + 0.5) * scale - 0.5
+// integer part of posSrc will be the index
+// fractional part of posSrc will be (1 - weight)
+/*
+ *      | wx0 | wx1 |
+ * [Y0X0]-----------[Y0X1]
+ *            |
+ *        wy0 | wy0
+ *            |
+ *       -----------
+ *            |
+ *        wy1 | wy1
+ *            |
+ * [Y1X0]-----------[Y1X1]
+ *
+ */
+__mlu_func__ void genMaskAndWeights(half *weightX0,
+                                    half *weightX1,
+                                    half *maskX0,
+                                    half *maskX1,
+                                    int scaleX,
+                                    int PosX,
+                                    int d_col,
+                                    int mult,
+                                    int colLimit) {
+  int posX = PosX;
+  half fx = 0.0;    // fractional part
+  int sx = 0;       // integer part
+  half wx0 = 0.0;   // weight for left point
+  half wx1 = 0.0;   // weight for right point
+  int sxPrev = -1;  // prev integer part
+  int jPrev = 0;    // the first new j
+  for (int j = 0; j < d_col; j++) {
+    // For each point in dst image, we can uniquely determine
+    // four points in src image. In down-scaling mode, n dst points
+    // has n distict src points, however in up-scaling mode, n dst
+    // points can share 1 src points. This results in the replication
+    // of src image later in the code.
+    fx = (half)((posX & 0xFFFF) >> 1) / 32768 * (int)(posX > 0);
+    sx = (posX >> 16) * (int)(posX > 0);
+    fx = fx * (int)(sx < colLimit);
+    sx = std::min(sx, colLimit);
+    wx0 = (((half)1.f - fx));
+    wx1 = (half)1 - wx0;
+    posX += scaleX;
+
+    // In up-scaling mode, we replicate each src row
+    // by a certain number, mult. When generating the mask,
+    // we must know which replication shall we use since they
+    // represent the same pixel. Thus we need a variable to
+    // [recrod the position of first new pixel], i.e., jPrev.
+    jPrev = j * (sxPrev != sx) + jPrev * (sxPrev == sx);
+    sxPrev = sx;
+    int offsetW0 = 4 * j;
+    int trueIdx0 = (sx * mult + (j - jPrev)) * 4;
+    int trueIdx1 = ((sx + 1) * mult + (j - jPrev)) * 4;
+    for (int k = 0; k < 4; k++) {
+      weightX0[offsetW0] = wx0;
+      weightX1[offsetW0++] = wx1;
+      maskX0[trueIdx0++] = 1;
+      maskX1[trueIdx1++] = 1;
+    }
+  }
+}
+
+__mlu_func__ int find_limit(int roi_w, int d_col, int mult, int channel) {
+  int lower_bound = 0;
+  int upper_bound = d_col + 1;
+  while (lower_bound < upper_bound - 1) {
+    int size = (lower_bound + upper_bound) / 2;
+    int size_pad = PAD_UP(size * channel, PAD_SIZE) / channel;
+
+    int src_size =
+        std::min(roi_w + PAD_SIZE, roi_w * (size_pad - 1) / d_col + 2 + PAD_SIZE / channel);
+    int src_size_pad = PAD_UP(src_size * channel, PAD_SIZE) / channel;
+
+    int malloc_size =
+        (2 * mult * src_size_pad + 2 * size_pad + std::max(4 * size_pad, 2 * src_size_pad) +
+         std::max(4 * size_pad, 2 * mult * src_size_pad)) *
+            channel * 2 +
+        channel * size_pad * 2 + 2 * MAX_SRCNUM + 32 * MAX_ROI_NUM;
+    if (malloc_size <= 2 * BUFFER_SIZE)  // half
+      lower_bound = size;
+    else
+      upper_bound = size;
+  }
+  return lower_bound;
+}
+/*---------------------------- MLU ENTRY FUNCTION ----------------------------*/
+__mlu_entry__ void PluginCropAndResizeKernel(void *dst_gdram,
+                                             void *src_gdram,
+                                             void *cropParams_gdram,
+                                             void *roiNums,
+                                             void *padValues,
+                                             int s_col,
+                                             int s_row,
+                                             int d_col_final,
+                                             int d_row_final,
+                                             int input2half,
+                                             int output2uint,
+                                             int batchNum,
+                                             int keepAspectRatio) {
+#if __BANG_ARCH__ != 290
+  /**---------------------- Initialization ----------------------**/
+  __wram__ half cpySyn[64 * 64 * 64];
+  __nram__ half buffer[BUFFER_SIZE + 2 * CO];
+  __nram__ half temp[64];
+  __nram__ unsigned int padValue[64];
+  half *cropParams = buffer + 64;
+  unsigned int padValueInt =
+      (((unsigned int *)padValues)[3] << 24) + (((unsigned int *)padValues)[2] << 16) +
+      (((unsigned int *)padValues)[1] << 8) + (((unsigned int *)padValues)[0]);
+  __bang_write_value(padValue, 64, padValueInt);
+
+  for (int i = 0; i < 16; i++) {
+    buffer[4 * i] = 0.5;
+    buffer[4 * i + 1] = 0.5;
+    buffer[4 * i + 2] = 0.5;
+    buffer[4 * i + 3] = 0;
+  }
+
+  /**----------------------- reSizedConvert -----------------------**/
+  half *dstAddrsGdram;
+  half *srcAddrsGdram;
+  // Input/output batchsize in terms of num of 2-btyes
+  int inputSize = s_col * s_row * 4 / (input2half + 1);
+  int outputSize = d_col_final * d_row_final * 4 / (output2uint + 1);
+  int sofar = 0;
+
+  for (int batch = 0; batch < batchNum; batch++) {
+    // Set src_ptr and load roiParams
+    srcAddrsGdram = inputSize * batch + (half *)src_gdram;
+    int roiNum = ((int *)roiNums)[batch];
+    __memcpy(cropParams, (int *)cropParams_gdram + 4 * sofar, 4 * roiNum * sizeof(int), GDRAM2NRAM);
+
+    // Deal with rois
+    for (int roi = 0; roi < roiNum; roi++) {
+      // Load rois and determine scaleX/Y
+      int roi_x = ((int *)cropParams)[4 * roi];
+      int roi_y = ((int *)cropParams)[4 * roi + 1];
+      int roi_w = ((int *)cropParams)[4 * roi + 2];
+      int roi_h = ((int *)cropParams)[4 * roi + 3];
+
+      int d_col = d_col_final;
+      int d_row = d_row_final;
+      half *dstPadAddrsGdram;
+      half *dstBatchAddrsGdram = outputSize * (roi + sofar) + (half *)dst_gdram;
+      if (keepAspectRatio && coreId != 0x80) {
+        float src_ar = (float)roi_w / roi_h;
+        float dst_ar = (float)d_col_final / d_row_final;
+        if (src_ar > dst_ar) {  // Align with col, pad bottom
+          d_row = d_col_final * roi_h / roi_w;
+          int pad_row = d_row_final - d_row;
+          int pad_row_rem = pad_row % taskDim;
+          int pad_row_seg = pad_row / taskDim;
+          int pad_row_core = pad_row_seg + (taskId < pad_row_rem);
+          int pad_row_accu = pad_row_seg * taskId + std::min(taskId, pad_row_rem);
+          dstPadAddrsGdram =
+              dstBatchAddrsGdram +
+              (d_col_final * d_row * 4 + d_col_final * pad_row_accu * 4) / (1 + output2uint);
+
+          int *one_line = (int *)cropParams + 4 * MAX_ROI_NUM;
+          __bang_write_value(one_line, PAD_UP(d_col_final * 4, 64) / 4, padValueInt);
+
+          if (pad_row_core > 0) {
+            __memcpy(dstPadAddrsGdram, one_line, d_col_final * 4, NRAM2GDRAM, d_col_final * 4, 0,
+                     pad_row_core - 1);
+          }
+        } else if (src_ar < dst_ar) {  // Align with row, pad right
+          d_col = d_row_final * roi_w / roi_h;
+          int pad_col = d_col_final - d_col;
+          int pad_row = d_row_final;
+          int pad_row_rem = pad_row % taskDim;
+          int pad_row_seg = pad_row / taskDim;
+          int pad_row_core = pad_row_seg + (taskId < pad_row_rem);
+          int pad_row_accu = pad_row_seg * taskId + std::min(taskId, pad_row_rem);
+          dstPadAddrsGdram =
+              dstBatchAddrsGdram + (d_col * 4 + pad_row_accu * d_col_final * 4) / (1 + output2uint);
+          int *one_line = (int *)cropParams + 4 * MAX_ROI_NUM;
+          __bang_write_value(one_line, PAD_UP(pad_col * 4, 64) / 4, padValueInt);
+          if (pad_row_core > 0) {
+            __memcpy(dstPadAddrsGdram, one_line, pad_col * 4, NRAM2GDRAM, d_col_final * 4, 0,
+                     pad_row_core - 1);
+          }
+        }
+      } else {  // Nothing to do
+      }
+
+      int scaleX = (roi_w << 16) / d_col;
+      int scaleY = (roi_h << 16) / d_row;
+      int d_row_rem = d_row % taskDim;
+      int d_row_seg = d_row / taskDim;
+      int d_row_core = d_row_seg + (taskId < d_row_rem);
+      int d_row_accu = d_row_seg * taskId + std::min(taskId, d_row_rem);
+
+      dstAddrsGdram = outputSize * (roi + sofar) + (half *)dst_gdram +
+                      d_row_accu * d_col_final * 4 / (output2uint + 1);
+
+      int posX = scaleX / 2 - 32768;  // Initial posSrc where posDst = 0
+      int rowLimit = roi_h - 1;
+      int colLimit = roi_w - 1;
+      int mult = (int)(roi_w < d_col) * (98304 + (scaleX >> 1)) / scaleX + (int)(roi_w >= d_col);
+      int limit = find_limit(roi_w, d_col, mult, 4);
+      int dstDealNum = PAD_UP(limit * 4, PAD_SIZE) / 4;
+
+      int repeat = d_col / dstDealNum;
+      int remainder = d_col % dstDealNum;
+      if (repeat != 0 && remainder == 0) {
+        repeat -= 1;
+        remainder = dstDealNum;
+      }
+      int srcDealNum = roi_w + 1;
+      int srcDealNumPad = PAD_UP(srcDealNum, PAD_SIZE);
+
+      // Memory usage
+      // Put all const variables(bias, weight, mask) at front of the buffer
+      // so that space after them can be used freely without concerning
+      // overwritting const variables
+      int srcNum = srcDealNumPad * 4;
+      int dstNum = dstDealNum * 4;
+      int weightNum = dstNum;
+      int maskNum = srcNum * mult;
+
+      half *weightX0 = (half *)cropParams + 4 * MAX_ROI_NUM * 2;
+      half *weightX1 = weightX0 + weightNum;
+      half *maskX0 = weightX1 + weightNum;
+      half *maskX1 = maskX0 + maskNum;
+      half *src = maskX1 + maskNum + 64;
+      half *sLine0 = src + std::max(4 * dstNum, maskNum * 2);
+      half *sLine1 = sLine0 + std::max(2 * dstNum, maskNum);
+
+      // Load filter/bias
+      loadFilters(cpySyn, weightX0, mult);
+
+      for (int i = 0; i < repeat + 1 /* remainder */; i++) {
+        /*###############################*/
+        /*#[Module 1]: genMaskAndWeights#*/
+        /*###############################*/
+        // for w segmentation
+        int src_index = std::max(posX / 65536, 0) * 0;
+        __bang_write_zero(maskX0, srcNum * mult);
+        __bang_write_zero(maskX1, srcNum * mult);
+        genMaskAndWeights(weightX0, weightX1, maskX0, maskX1, scaleX, posX - src_index * 65536,
+                          d_col, mult, colLimit - (i == repeat) * src_index);
+
+        /*###########################*/
+        /*#[Module 2]: loadTwoLines #*/
+        /*###########################*/
+        // posY and finalPosY locate which segment of src
+        // resizeOp is dealing with (multi-core support)
+        // fy(fractional part of posY) records the weight
+        // sy(integer part of posY) records the position
+        int posY = d_row_accu * scaleY + (scaleY >> 1) - 32768;
+        int finalPosY = posY + (d_row_core - 1) * scaleY;
+        half fy = 0.0;
+        int sy = 0;
+        half wy0 = 0.0;
+        half wy1 = 0.0;
+        for (int j = 0; j < d_row_core; ++j) {
+          sy = (posY >> 16) * (int)(posY > 0);
+          sy = std::min(sy, rowLimit - 1) + roi_y;
+
+          int offset0 = (sy * s_col + roi_x + src_index) * 4;
+          int offset1 = ((sy + 1) * s_col + roi_x + src_index) * 4;
+          int dealNum = srcDealNumPad * 4;
+          if (input2half) {
+            int size = roi_w * 4 * sizeof(char);
+            __memcpy(sLine0, (char *)srcAddrsGdram + offset0, size, GDRAM2NRAM);
+            __memcpy((char *)sLine0 + dealNum, (char *)srcAddrsGdram + offset1, size, GDRAM2NRAM);
+            __bang_uchar2half(src, (unsigned char *)sLine0, dealNum * 2);
+          } else {
+            int size = roi_w * 4 * sizeof(half);
+            __memcpy(src, srcAddrsGdram + offset0, size, GDRAM2NRAM);
+            __memcpy(src + dealNum, srcAddrsGdram + offset1, size, GDRAM2NRAM);
+          }
+
+          /*#################################*/
+          /*#[Module 5]: src image expansion#*/
+          /*#################################*/
+          if (mult > 1) {
+            // in_channel = CI;
+            // in_height = 1;
+            // in_width = srcDealNumPad * 4 / CI;
+            // filter_height = 1;
+            // filter_width = 1;
+            // stride_height = 1;
+            // stride_width = 1;
+            // out_channel = CO;
+            // __bang_half2fix16_rd((int16_t*)sLine0, src, srcDealNumPad * 8, -7);
+            __bang_half2int16_rd((int16_t *)sLine0, src, srcDealNumPad * 8, -7);
+            __bang_conv(src, (int16_t *)sLine0, (int16_t *)cpySyn, CI, 1, srcDealNumPad * 8 / CI, 1,
+                        1, 1, 1, CI * mult, -7);
+          }
+          // Select data using the mask generated in [1]
+          // For example,
+          /* Before:
+           * [Y0X0 Y0X1] ... [Y0X4 Y0X5] ... [Y0X8 Y0X9] ...
+           * [Y1X0 Y1X1] ... [Y1X4 Y1X5] ... [Y1X8 Y1X9] ...
+           *  .    .          .    .          .    .
+           *  .    .          .    .          .    .
+           *
+           * After:
+           * Y0X0 Y0X4 Y0X8 ... Y0X1 Y0X5 Y0X9 ...
+           * Y1X0 Y1X4 Y1X8 ... Y1X1 Y1X5 Y1X9 ...
+           * .    .    .        .    .    .
+           * .    .    .        .    .    .
+           */
+
+          __bang_collect(sLine0, src, maskX0, maskNum);
+          __bang_collect(sLine0 + dstNum, src, maskX1, maskNum);
+          __bang_collect(sLine1, src + maskNum, maskX0, maskNum);
+          __bang_collect(sLine1 + dstNum, src + maskNum, maskX1, maskNum);
+
+          int NextPosY = std::min(((posY >> 16) + 1) << 16, finalPosY);
+          int srcReuseNum = std::max(1, (NextPosY - posY) / scaleY);
+          for (int srcReuse = 0; srcReuse < srcReuseNum; srcReuse++) {
+            // move calculation from [Module 2] to here to optimize
+            // up-sclaing mode.
+            fy = (half)((posY & 0xFFFF) >> 1) / 32768 * (int)(posY > 0);
+            sy = (posY >> 16) * (int)(posY > 0);
+            fy = fy * (int)(sy < rowLimit) + (int)(sy == rowLimit);
+            wy0 = (((half)1.f - fy));
+            wy1 = (half)1.0 - wy0;
+            posY += scaleY;
+            /*####################################*/
+            /*#[Module 6]. Bilinear Interpolation#*/
+            /*####################################*/
+            // x_star0 = Y0X0 * wx0 + Y0X1 * wx1
+            half *dstLine0 = src;
+            half *dstLine1 = dstLine0 + 2 * dstNum;
+            __bang_mul(dstLine0, sLine0, weightX0, dstNum * 2);
+            __bang_add(dstLine0, dstLine0, dstLine0 + dstNum, dstNum);
+
+            // x_star1 = Y1X0 * wx0 + Y1X1 * wx1
+            __bang_mul(dstLine1, sLine1, weightX0, dstNum * 2);
+            __bang_add(dstLine1, dstLine1, dstLine1 + dstNum, dstNum);
+
+            // x_star = x_star0 * wy0 + x_star1 * wy1
+            __bang_mul_scalar(dstLine0, dstLine0, wy0, dstNum);
+            __bang_mul_scalar(dstLine1, dstLine1, wy1, dstNum);
+            __bang_add(dstLine0, dstLine0, dstLine1, dstNum);
+
+            __bang_cycle_add(dstLine0, dstLine0, buffer, dstNum, 64);
+
+            /*##################################################################*/
+            /*#[Module 7]: Postprocess && Store Data(Depadding not implemented)#*/
+            /*##################################################################*/
+            half *dst = dstLine0;
+            half *dstMask = dst + PAD_UP(dstNum / 4, PAD_SIZE) * 4;
+            int true_dstNum = dstNum * (i < repeat) + remainder * 4 * (i == repeat);
+            int true_dstSize = true_dstNum * sizeof(half);
+            if (output2uint) {
+              __bang_write_value(temp, 64, (half)127);
+              __bang_cycle_gt(dstMask, dst, temp, PAD_UP(dstNum / 4, PAD_SIZE) * 4, 64);
+              __bang_mul_scalar(dstMask, dstMask, 256, dstNum);
+              __bang_sub(dstMask, dst, dstMask, dstNum);
+              __bang_half2uchar_dn((signed char *)dst, dstMask, PAD_UP(dstNum, 128));
+              true_dstSize = true_dstNum * sizeof(char);
+            }
+            __memcpy((char *)dstAddrsGdram + j * d_col_final * 4 + i * dstNum * (2 - output2uint),
+                     dst, d_col * 4 * (2 - output2uint), NRAM2GDRAM);
+            j += (int)(srcReuseNum > 0);
+          }
+          j -= (int)(srcReuseNum > 0);
+        }
+        posX += dstDealNum * scaleX;
+      }
+    }
+    sofar += roiNum;
+  }
+#else
+  printf("[PluginCropAndResize] Kernel does not support MLU290.");
+#endif
+}
+
+static int PolicyFunc(cnrtDim3_t *dim, cnrtFunctionType_t *ktype) {
+  // Get device info and user-determined task info
+  CNdev mlu_dev;
+  CNcontext drv_ctx;
+  CNctxConfigParam ctx_conf_param;
+  int32_t visible_cluster_count = 0;
+  int32_t core_num_per_cluster = 0;
+
+  if (CN_SUCCESS != cnCtxGetDevice(&mlu_dev)) {
+    printf("[CropAndResizeEnqueue] Get mlu device type in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS != cnDeviceGetAttribute(&core_num_per_cluster,
+                                         CN_DEVICE_ATTRIBUTE_MAX_CORE_COUNT_PER_CLUSTER, mlu_dev)) {
+    printf(
+        "[CropAndResizeEnqueue] Get mlu device max core count per cluster in PolicyFunc "
+        "failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS != cnCtxGetCurrent(&drv_ctx)) {
+    printf("[CropAndResizeEnqueue] Get mlu drv context in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS !=
+      cnGetCtxConfigParam(drv_ctx, CN_CTX_CONFIG_VISIBLE_CLUSTER_NUM, &ctx_conf_param)) {
+    printf("[CropAndResizeEnqueue] Get mlu drv visible cluster num in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  // Maybe helpful but not used.
+  // int32_t max_cluster_count = 0;
+  // if (CN_SUCCESS !=
+  //     cnDeviceGetAttribute(&max_cluster_count, CN_DEVICE_ATTRIBUTE_MAX_CLUSTER_COUNT, mlu_dev)) {
+  //   printf("[CropAndResizeEnqueue] Get mlu device cluster num in PolicyFunc failed.\n");
+  //   return -1;
+  // }
+
+  visible_cluster_count = ctx_conf_param.visibleClusterNumber;
+  int dim_y_tmp = 1;
+  cnrtFunctionType_t ktype_tmp = CNRT_FUNC_TYPE_UNION2;
+  if (core_num_per_cluster == 1 || core_num_per_cluster == 4) {
+    dim_y_tmp = 2;
+    ktype_tmp = CNRT_FUNC_TYPE_UNION1;
+  }
+
+  switch (visible_cluster_count) {
+    case 0: {
+      dim->x = 1;
+      dim->y = 1;
+      dim->z = 1;
+      *ktype = CNRT_FUNC_TYPE_BLOCK;
+    }; break;
+    case 1: {
+      dim->x = core_num_per_cluster;
+      dim->y = 1;
+      dim->z = 1;
+      *ktype = CNRT_FUNC_TYPE_UNION1;
+    }; break;
+    case 2: {
+      dim->x = core_num_per_cluster;
+      dim->y = dim_y_tmp;
+      dim->z = 1;
+      *ktype = ktype_tmp;
+    }; break;
+    case 4:
+    case 6:
+    case 8:
+    case 16: {
+      dim->x = 16;
+      dim->y = 1;
+      dim->z = 1;
+      *ktype = CNRT_FUNC_TYPE_UNION4;
+    }; break;
+    default: {
+      printf("Failed to choose kernel to launch.\n");
+      return -1;
+    }
+  }
+  return 0;
+}
+
+void CropAndResizeEnqueue(cnrtQueue_t queue,
+                          void *dst_gdram,
+                          void *src_gdram,
+                          void *cropParams_gdram,
+                          void *roiNums,
+                          void *padValues,
+                          int s_col,
+                          int s_row,
+                          int d_col_final,
+                          int d_row_final,
+                          int input2half,
+                          int output2uint,
+                          int batchNum,
+                          int keepAspectRatio) {
+  cnrtDim3_t dim;
+  cnrtFunctionType_t ktype;
+  if (PolicyFunc(&dim, &ktype)) {
+    printf("[CropAndResizeEnqueue]: PolicyFunc run failed\n");
+    return;
+  }
+
+  PluginCropAndResizeKernel<<<dim, ktype, queue>>>(
+      dst_gdram, src_gdram, cropParams_gdram, roiNums, padValues, s_col, s_row, d_col_final,
+      d_row_final, input2half, output2uint, batchNum, keepAspectRatio);
+}

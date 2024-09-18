@@ -1,0 +1,14 @@
+# Copyright (C) [2020-2023] The Cambricon Authors. All Rights Reserved.   
+# model configuration for tensorflow.
+
+resnet50:
+  resize_size: [224, 224]
+  center_crop_size: [224, 224]
+  need_bgr2rgb: True
+  need_transpose: False
+  need_normalize: False
+  mean: [123.68, 116.78, 103.94]
+  std: [1.0,1.0,1.0]
+
+
+

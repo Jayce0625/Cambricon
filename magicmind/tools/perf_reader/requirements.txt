@@ -1,0 +1,2 @@
+prettytable
+textwrap3 >= 0.9

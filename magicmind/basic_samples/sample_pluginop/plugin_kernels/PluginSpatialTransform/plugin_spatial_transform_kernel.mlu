@@ -1,0 +1,881 @@
+/*************************************************************************
+ * Copyright (C) [2020-2023] by Cambricon, Inc.
+ *************************************************************************/
+#include "bang.h"
+#include <mlu.h>
+#include "cn_api.h"
+#include "cnnl.h"
+
+#define NRAM_REMAIN_SIZE (4096)
+#define NRAM_BUF_SIZE (__MLU_NRAM_SIZE__ * 1024 - NRAM_REMAIN_SIZE)
+#define SRAM_BUF_SIZE (__MLU_SRAM_SIZE__ * 800)
+#define ALIGN_NUM 64
+#define CALC_LINE_NUM 14
+#define DATA_LINE_NUM 4
+
+#define ALIGN_UP(a, b) (((a) + (b)-1) / (b) * (b))
+#define ALIGN_DN(a, b) ((a) / (b) * (b))
+#define DIV_UP(a, b) (((a) + (b)-1) / (b))
+#define DIV_DN(a, b) ((a) / (b))
+
+#define MAX(a, b) ((a) >= (b) ? (a) : (b))
+#define MIN(a, b) ((a) <= (b) ? (a) : (b))
+#define ABS(a) (((a) > 0) ? (a) : (-(a)))
+
+enum Location {
+  kNram,
+  kSram,
+  kGdram,
+};
+
+template <typename T, typename F>
+__mlu_func__ void nramset(T *ptr, int size, F value) {
+  __bang_write_value(ptr, size, (T)value);
+}
+
+__mlu_func__ void segTask(int size, int up, int *start, int *end) {
+  int div = DIV_UP(size, taskDim * up);
+  div *= up;
+
+  *start = taskId * div;
+  *end = MIN(size, (taskId + 1) * div);
+}
+
+__mlu_func__ int computeMutableSize(int src_size_up, int dst_w_up, int c, int dt, int ft) {
+  int M = 128;
+  int block3;
+  {
+    int dividend = NRAM_BUF_SIZE - M - src_size_up - ft * ALIGN_NUM;
+    int divisor = (ft * (CALC_LINE_NUM * c + 1) + dt * DATA_LINE_NUM * c) * dst_w_up;
+    block3 = dividend / divisor;
+  }
+  return block3;
+}
+
+__mlu_func__ void schedule(int src_h,
+                           int src_w,
+                           int dst_h,
+                           int dst_w,
+                           int c,
+                           int dt,
+                           int ft,
+                           int *block_h,
+                           Location *loc) {
+  int src_size_up = ALIGN_UP(src_h * src_w * c, ALIGN_NUM * 2) * dt;
+  int dst_w_up = ALIGN_UP(dst_w, ALIGN_NUM);
+
+  int block = computeMutableSize(src_size_up, dst_w_up, c, dt, ft);
+
+  if (block > 0) {
+    *loc = kNram;
+    *block_h = block;
+  } else {
+    int block = computeMutableSize(0, dst_w_up, c, dt, ft);
+
+    if (src_size_up <= SRAM_BUF_SIZE && taskDim > 1) {
+      *loc = kSram;
+      *block_h = block;
+    } else {
+      *loc = kGdram;
+      *block_h = block;
+    }
+  }
+}
+
+__mlu_func__ void f2i_dn(uint8_t *dst, half *src, int size, half *nram_buf) {
+  __bang_half2uchar_dn(dst, src, src + size, size);
+}
+
+__mlu_func__ void f2i_dn(uint8_t *dst, float *src, int size, float *nram_buf) {
+  float *addition = nram_buf;               // size
+  float *addition_const = addition + size;  // ALIGN_NUM
+
+  nramset(addition_const, ALIGN_NUM, ALIGN_NUM * 2);
+  __bang_cycle_ge(addition, src, addition_const, size, ALIGN_NUM);
+  __bang_mul_scalar(addition, addition, -4 * ALIGN_NUM, size);
+  __bang_add(addition, src, addition, size);
+  __bang_float2int8_rd((int8_t *)dst, addition, ALIGN_UP(size, ALIGN_NUM * 2), 0);
+}
+
+__mlu_func__ void f2i_dn(int16_t *dst, float *src, int size) {
+  __bang_float2int16_dn(dst, src, size, 0);
+}
+
+__mlu_func__ void f2i_dn(int16_t *dst, half *src, int size) {
+  __bang_half2int16_dn(dst, src, size, 0);
+}
+
+__mlu_func__ void i2f(float *dst, int16_t *src, int size) {
+  __bang_int162float(dst, src, size, 0);
+}
+
+__mlu_func__ void i2f(half *dst, int16_t *src, int size) {
+  __bang_int162half(dst, src, size, 0);
+}
+
+__mlu_func__ void i2f(float *dst, uint8_t *src, int size, float *nram_buf) {
+  float *addition = nram_buf;               // size
+  float *addition_const = addition + size;  // ALIGN_NUM
+  __bang_int82float(dst, (int8_t *)src, size, 0);
+  __bang_write_zero(addition_const, ALIGN_NUM);
+  __bang_cycle_lt(addition, dst, addition_const, size, ALIGN_NUM);
+  __bang_mul_scalar(addition, addition, 256, size);
+  __bang_add(dst, dst, addition, size);
+}
+
+__mlu_func__ void i2f(half *dst, uint8_t *src, int size, half *nram_buf) {
+  __bang_uchar2half(dst, src, size);
+}
+
+__mlu_func__ void h2f(half *dst, half *src, int size) {
+  __memcpy(dst, src, sizeof(half) * size, NRAM2NRAM);
+}
+
+__mlu_func__ void h2f(float *dst, half *src, int size) {
+  __bang_half2float(dst, src, size);
+}
+
+__mlu_func__ void f2h(half *dst, float *src, int size) {
+  __bang_float2half_dn(dst, src, size);
+}
+
+__mlu_func__ void f2h(half *dst, half *src, int size) {
+  __memcpy(dst, src, size * sizeof(half), NRAM2NRAM);
+}
+
+template <typename T>
+__mlu_func__ void GenerateMask100(T *mask, int size, int loop) {
+  for (int i = 0; i < ALIGN_NUM * loop; ++i) {
+    mask[i] = (i % loop == 0);
+  }
+  for (int i = ALIGN_NUM * loop; i < size; i += ALIGN_NUM * loop) {
+    __memcpy(mask + i, mask, sizeof(T) * ALIGN_NUM * loop, NRAM2NRAM);
+  }
+}
+
+template <typename T>
+__mlu_func__ void GenerateMask000111(T *mask, int size, int loop) {
+  for (int i = 0; i < ALIGN_NUM * loop; ++i) {
+    mask[i] = (i % loop) >= (loop / 2);
+  }
+  for (int i = ALIGN_NUM * loop; i < size; i += ALIGN_NUM * loop) {
+    int s = MIN(ALIGN_NUM * loop, size - i);
+    __memcpy(mask + i, mask, sizeof(T) * s, NRAM2NRAM);
+  }
+}
+
+template <typename T>
+__mlu_func__ void Floor(T *dst, T *src, int size, int16_t *nram_buf) {
+  // sizeof(int16_t) * size
+  f2i_dn(nram_buf, src, size);
+  i2f(dst, nram_buf, size);
+}
+
+template <typename T, typename DT>
+__mlu_func__ void Remap(T *left_top,
+                        T *right_top,
+                        T *left_bottom,
+                        T *right_bottom,
+                        T *left_top_index,
+                        int dst_hw,
+                        int src_hw,
+                        int src_w,
+                        int c,
+                        T *nram_buf,
+                        DT *src_ddr,
+                        DT *sram_buf,
+                        DT *src_inchip,
+                        Location loc) {
+#define MEMCPY1(x, ptr, copy_func, c, dir)                                                        \
+  int lt##x = left_top_index[i + x];                                                   \
+  copy_func(left_top_dt + (i + x) * 2, ptr + lt##x, sizeof(DT) * 2, dir, sizeof(DT) * 2 * chw_up, \
+      sizeof(DT) * src_w, 2 - 1);
+
+#define MEMCPYC(x, ptr, copy_func, c, dir)                                                                    \
+  int lt##x = left_top_index[i + x];                                                               \
+  copy_func(left_top_dt + (i + x) * 2 * c, ptr + lt##x * c, sizeof(DT) * 2 * c, dir, sizeof(DT) * 2 * chw_up, \
+      sizeof(DT) * src_w * c, 2 - 1);
+
+#define MEMCPY1I16(x, ptr, copy_func, c, dir)                                                     \
+  int16_t lt##x = left_top_index_i16[i + x];                                           \
+  copy_func(left_top_dt + (i + x) * 2, ptr + lt##x, sizeof(DT) * 2, dir, sizeof(DT) * 2 * chw_up, \
+      sizeof(DT) * src_w, 2 - 1);
+
+#define MEMCPYCI16(x, ptr, copy_func, c, dir)                                                                 \
+  int16_t lt##x = left_top_index_i16[i + x];                                                       \
+  copy_func(left_top_dt + (i + x) * 2 * c, ptr + lt##x * c, sizeof(DT) * 2 * c, dir, sizeof(DT) * 2 * chw_up, \
+      sizeof(DT) * src_w * c, 2 - 1);
+
+#define UNROLL16(FUNC, ptr, copy_func, c, dir) \
+  FUNC(0, ptr, copy_func, c, dir);             \
+  FUNC(1, ptr, copy_func, c, dir);             \
+  FUNC(2, ptr, copy_func, c, dir);             \
+  FUNC(3, ptr, copy_func, c, dir);             \
+  FUNC(4, ptr, copy_func, c, dir);             \
+  FUNC(5, ptr, copy_func, c, dir);             \
+  FUNC(6, ptr, copy_func, c, dir);             \
+  FUNC(7, ptr, copy_func, c, dir);             \
+  FUNC(8, ptr, copy_func, c, dir);             \
+  FUNC(9, ptr, copy_func, c, dir);             \
+  FUNC(10, ptr, copy_func, c, dir);            \
+  FUNC(11, ptr, copy_func, c, dir);            \
+  FUNC(12, ptr, copy_func, c, dir);            \
+  FUNC(13, ptr, copy_func, c, dir);            \
+  FUNC(14, ptr, copy_func, c, dir);            \
+  FUNC(15, ptr, copy_func, c, dir);
+
+#define MULTI_LOC(FUNC, c)                                                    \
+  if (loc == kNram) {                                                         \
+    for (int i = 0; i < dst_hw; i += 16) {                                    \
+      UNROLL16(FUNC, src_inchip, __memcpy_async, c, NRAM2NRAM); \
+    }                                                                         \
+  } else if (loc == kSram) {                                                  \
+    for (int i = 0; i < dst_hw; i += 16) {                                    \
+      UNROLL16(FUNC, sram_buf, __memcpy_async, c, SRAM2NRAM);   \
+    }                                                                         \
+  } else if (loc == kGdram) {                                                 \
+    for (int i = 0; i < dst_hw; i += 16) {                                    \
+      UNROLL16(FUNC, src_ddr, __memcpy_async, c, GDRAM2NRAM);   \
+    }                                                                         \
+  }
+
+  int hw_up = ALIGN_UP(dst_hw, ALIGN_NUM);
+  int chw_up = hw_up * c;
+
+  // [smarsu size]: sizeof(DT) * 4 * chw_up
+  DT *left_top_dt = (DT *)nram_buf;  // 4 * chw_up
+
+  __mlvm_sync();
+  if (src_hw < 1 << 14) {
+    int16_t *left_top_index_i16 = (int16_t *)left_top_index;
+    f2i_dn(left_top_index_i16, left_top_index, hw_up);
+
+    if (c == 1) {
+      MULTI_LOC(MEMCPY1I16, 1);
+    } else {
+      MULTI_LOC(MEMCPYCI16, c);
+    }
+  } else {
+    if (c == 1) {
+      MULTI_LOC(MEMCPY1, 1);
+    } else {
+      MULTI_LOC(MEMCPYC, c);
+    }
+  }
+  __mlvm_sync();
+
+  // [smarsu size]: 4 * chw_up
+  T *mask = (T *)(left_top_dt + 4 * chw_up);  // 2 * chw_up
+  T *swap = mask + 2 * chw_up;                // 2 * chw_up
+
+  GenerateMask000111(mask, 2 * chw_up, c * 2);
+
+  // [smarsu size]: 2 * chw_up + ALIGN_NUM
+  h2f(swap, left_top_dt, 2 * chw_up);
+  __bang_collect(right_top, swap, mask, 2 * chw_up);
+  __bang_not(mask, mask, 2 * chw_up);
+  __bang_collect(left_top, swap, mask, 2 * chw_up);
+
+  // [smarsu size]: 2 * chw_up + ALIGN_NUM
+  h2f(swap, left_top_dt + 2 * chw_up, 2 * chw_up);
+  __bang_collect(left_bottom, swap, mask, 2 * chw_up);
+  __bang_not(mask, mask, 2 * chw_up);
+  __bang_collect(right_bottom, swap, mask, 2 * chw_up);
+}
+
+template <typename T>
+__mlu_func__ void Range(T *rg, int size) {
+  for (int i = 0; i < ALIGN_NUM; ++i) {
+    rg[i] = i;
+  }
+  for (int i = 1; i < size / ALIGN_NUM; ++i) {
+    nramset(rg + i * ALIGN_NUM, ALIGN_NUM, i * ALIGN_NUM);
+    __bang_add(rg + i * ALIGN_NUM, rg + i * ALIGN_NUM, rg, ALIGN_NUM);
+  }
+}
+
+template <typename T>
+__mlu_func__ void Range(T *rg, int size, int loop) {
+  for (int i = 0; i < ALIGN_NUM * loop; ++i) {
+    rg[i] = i / loop;
+  }
+  for (int i = 1; i < size / (ALIGN_NUM * loop); ++i) {
+    nramset(rg + i * ALIGN_NUM * loop, ALIGN_NUM * loop, i * ALIGN_NUM);
+    __bang_add(rg + i * ALIGN_NUM * loop, rg + i * ALIGN_NUM * loop, rg, ALIGN_NUM * loop);
+  }
+}
+
+template <typename T>
+__mlu_func__ void
+MapToSrc(T *to_src_x, T *to_src_y, float *M, int h_begin, int h, int w, int c, T *nram_buf) {
+  // No block at w axis.
+  int w_up = ALIGN_UP(w, ALIGN_NUM);
+  int size = h * w;
+  int size_up = ALIGN_UP(size, ALIGN_NUM);
+  int csize_up = size_up * c;
+
+  // For case h, w = 100, 1, h * w_up = 6400, size_up = 128
+  // [smarsu size]: 2 * h * w_up * c + ALIGN_NUM + 2 * size_up * c
+  T *width = nram_buf;               // h * w_up * c
+  T *height = width + h * w_up * c;  // h * w_up * c
+  T *bias = height + h * w_up * c;   // ALIGN_NUM
+  T *x = bias + ALIGN_NUM;           // csize_up
+  T *y = x + csize_up;               // csize_up
+
+  Range(width, w_up * c, c);
+  for (int i = 1; i < h; ++i) {
+    __memcpy(width + i * w_up * c, width, sizeof(T) * w_up * c, NRAM2NRAM);
+  }
+  if (w != w_up) {
+    __memcpy(width, width, sizeof(T) * w * c, NRAM2NRAM, sizeof(T) * w * c, sizeof(T) * w_up * c,
+             h - 1);
+  }
+
+  for (int i = 0; i < h; ++i) {
+    nramset(height + i * w_up * c, w_up * c, h_begin + i);
+  }
+  if (w != w_up) {
+    __memcpy(height, height, sizeof(T) * w * c, NRAM2NRAM, sizeof(T) * w * c, sizeof(T) * w_up * c,
+             h - 1);
+  }
+
+  nramset(bias, ALIGN_NUM, M[2]);
+  __bang_mul_scalar(x, width, M[0], csize_up);
+  __bang_mul_scalar(y, height, M[1], csize_up);
+  __bang_add(to_src_x, x, y, csize_up);
+  __bang_cycle_add(to_src_x, to_src_x, bias, csize_up, ALIGN_NUM);
+
+  nramset(bias, ALIGN_NUM, M[5]);
+  __bang_mul_scalar(x, width, M[3], csize_up);
+  __bang_mul_scalar(y, height, M[4], csize_up);
+  __bang_add(to_src_y, x, y, csize_up);
+  __bang_cycle_add(to_src_y, to_src_y, bias, csize_up, ALIGN_NUM);
+}
+
+template <typename T>
+__mlu_func__ void PrepareWeight(T *left_w,
+                                T *right_w,
+                                T *top_w,
+                                T *bottom_w,
+                                T *left_top_index,
+                                float *M,
+                                int h_begin,
+                                int h,
+                                int w,
+                                int src_h,
+                                int src_w,
+                                int c,
+                                T *nram_buf) {
+  int size = h * w;
+  int size_up = ALIGN_UP(size, ALIGN_NUM);
+  int csize_up = size_up * c;
+
+  // int w_up = ALIGN_UP(w, ALIGN_NUM);
+  // level1: 2 * size_up * c + 2 * h * w_up * c + ALIGN_NUM + 2 * size_up * c
+  // level2: 2 * size_up * c + ALIGN_NUM
+  // level3: 2 * size_up * c + 2 * size_up * c + ALIGN_NUM + size_up * c
+
+  // [smarsu size]: 2 * size_up * c
+  T *to_src_x = nram_buf;             // csize_up
+  T *to_src_y = to_src_x + csize_up;  // csize_up
+
+  // [smarsu size]: 2 * h * w_up * c + ALIGN_NUM + 2 * size_up * c
+  MapToSrc(to_src_x, to_src_y, M, h_begin, h, w, c, to_src_y + csize_up);
+
+  // [smarsu size]: ALIGN_NUM
+  T *target = to_src_y + csize_up;  // ALIGN_NUM
+  // [smarsu size]: 2 * size_up * c + ALIGN_NUM
+  T *left = to_src_y + csize_up + ALIGN_NUM;  // csize_up
+  T *top = left + csize_up;                   // csize_up
+  T *ones = top + csize_up;                   // ALIGN_NUM
+  T *left_w_tmp = ones + ALIGN_NUM;
+  T *right_w_tmp = left_w_tmp + csize_up;
+  T *tmp = right_w_tmp + csize_up;
+
+  // [smarsu size]: sizeof(int16_t) * 2 * size * c
+  Floor(left, to_src_x, 2 * csize_up, (int16_t *)(ones + ALIGN_NUM));
+
+  nramset(ones, ALIGN_NUM, 1);
+  __bang_sub(right_w, to_src_x, left, csize_up);
+  __bang_mul_scalar(left_w, right_w, -1, csize_up);
+  __bang_cycle_add(left_w, left_w, ones, csize_up, ALIGN_NUM);
+
+  __bang_sub(bottom_w, to_src_y, top, csize_up);
+  __bang_mul_scalar(top_w, bottom_w, -1, csize_up);
+  __bang_cycle_add(top_w, top_w, ones, csize_up, ALIGN_NUM);
+
+  // left edge
+  nramset(target, ALIGN_NUM, 0);
+  __bang_cycle_ge(top, to_src_x, target, csize_up, ALIGN_NUM);
+  __bang_mul(left_w, left_w, top, csize_up);
+  nramset(target, ALIGN_NUM, -1);
+  __bang_cycle_ge(top, to_src_x, target, csize_up, ALIGN_NUM);
+  __bang_mul(right_w, right_w, top, csize_up);
+
+  // right edge
+  nramset(target, ALIGN_NUM, (src_w - 1));
+  __bang_cycle_le(top, to_src_x, target, csize_up, ALIGN_NUM);
+  __bang_mul(right_w, right_w, top, csize_up);
+  nramset(target, ALIGN_NUM, (src_w));
+  __bang_cycle_lt(top, to_src_x, target, csize_up, ALIGN_NUM);
+  __bang_mul(left_w, left_w, top, csize_up);
+
+  // top edge
+  nramset(target, ALIGN_NUM, 0);
+  __bang_cycle_ge(top, to_src_y, target, csize_up, ALIGN_NUM);
+  __bang_mul(top_w, top_w, top, csize_up);
+  nramset(target, ALIGN_NUM, -1);
+  __bang_cycle_ge(top, to_src_y, target, csize_up, ALIGN_NUM);
+  __bang_mul(bottom_w, bottom_w, top, csize_up);
+
+  // bottom edge
+  nramset(target, ALIGN_NUM, (src_h - 1));
+  __bang_cycle_le(top, to_src_y, target, csize_up, ALIGN_NUM);
+  __bang_mul(bottom_w, bottom_w, top, csize_up);
+  nramset(target, ALIGN_NUM, (src_h));
+  __bang_cycle_lt(top, to_src_y, target, csize_up, ALIGN_NUM);
+  __bang_mul(top_w, top_w, top, csize_up);
+
+  Floor(left, to_src_x, 2 * csize_up, (int16_t *)(ones + ALIGN_NUM));
+
+  nramset(target, ALIGN_NUM, -1);
+  __bang_cycle_maxequal(left, left, target, csize_up, ALIGN_NUM);
+  __bang_cycle_maxequal(top, top, target, csize_up, ALIGN_NUM);
+  nramset(target, ALIGN_NUM, src_h - 1);
+  __bang_cycle_minequal(top, top, target, csize_up, ALIGN_NUM);
+  nramset(target, ALIGN_NUM, src_w - 1);
+  __bang_cycle_minequal(left, left, target, csize_up, ALIGN_NUM);
+
+  // for w left edge judgment --> (-1)-->(0)
+  // change left_w and right_w according to to_src_x mask
+  nramset(target, ALIGN_NUM, -1);
+  __bang_cycle_eq(to_src_x, left, target, csize_up, ALIGN_NUM);
+  nramset(to_src_y, csize_up, 0);
+  __bang_mul(to_src_y, to_src_y, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(left, left, to_src_x, csize_up);
+  __bang_add(left, left, to_src_y, csize_up);
+
+  // right_w -> left_w
+  __bang_mul(left_w_tmp, left_w, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(tmp, left_w, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, right_w, to_src_x, csize_up);
+  __bang_add(left_w, left_w_tmp, right_w_tmp, csize_up);
+
+  // left_w -> right_w
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, right_w, to_src_x, csize_up);
+  __bang_add(right_w, tmp, right_w_tmp, csize_up);
+
+  // for w right edge judgment --> (src_w - 1)-->(src_w - 2)
+  // change left_w and right_w according to to_src_x mask
+  nramset(target, ALIGN_NUM, src_w - 1);
+  __bang_cycle_eq(to_src_x, left, target, csize_up, ALIGN_NUM);
+  nramset(to_src_y, csize_up, src_w - 2);
+  __bang_mul(to_src_y, to_src_y, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(left, left, to_src_x, csize_up);
+  __bang_add(left, left, to_src_y, csize_up);
+
+  // right_w -> left_w
+  __bang_mul(left_w_tmp, left_w, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(tmp, left_w, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, right_w, to_src_x, csize_up);
+  __bang_add(left_w, left_w_tmp, right_w_tmp, csize_up);
+
+  // left_w -> right_w
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, right_w, to_src_x, csize_up);
+  __bang_add(right_w, tmp, right_w_tmp, csize_up);
+
+  // for h upper edge judgment --> (-1)-->(0)
+  // change top_w and bottom_w according to to_src_x mask
+  nramset(target, ALIGN_NUM, -1);
+  __bang_cycle_eq(to_src_x, top, target, csize_up, ALIGN_NUM);
+  nramset(to_src_y, csize_up, 0);
+  __bang_mul(to_src_y, to_src_y, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(top, top, to_src_x, csize_up);
+  __bang_add(top, top, to_src_y, csize_up);
+
+  // bottom_w -> top_w
+  __bang_mul(left_w_tmp, top_w, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(tmp, top_w, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, bottom_w, to_src_x, csize_up);
+  __bang_add(top_w, left_w_tmp, right_w_tmp, csize_up);
+
+  // top_w -> bottom_w
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, bottom_w, to_src_x, csize_up);
+  __bang_add(bottom_w, tmp, right_w_tmp, csize_up);
+
+  // for h down edge judgment --> (src_h - 1)-->(src_h - 2)
+  // change top_w and bottom_w according to to_src_x mask
+  nramset(target, ALIGN_NUM, src_h - 1);
+  __bang_cycle_eq(to_src_x, top, target, csize_up, ALIGN_NUM);
+  nramset(to_src_y, csize_up, src_h - 2);
+  __bang_mul(to_src_y, to_src_y, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(top, top, to_src_x, csize_up);
+  __bang_add(top, top, to_src_y, csize_up);
+
+  // bottom_w -> top_w
+  __bang_mul(left_w_tmp, top_w, to_src_x, csize_up);
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(tmp, top_w, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, bottom_w, to_src_x, csize_up);
+  __bang_add(top_w, left_w_tmp, right_w_tmp, csize_up);
+
+  // top_w -> bottom_w
+  __bang_not(to_src_x, to_src_x, csize_up);
+  __bang_mul(right_w_tmp, bottom_w, to_src_x, csize_up);
+  __bang_add(bottom_w, tmp, right_w_tmp, csize_up);
+
+  if (c > 1) {
+    // [smarsu size]: size_up * c
+    T *mask = top + csize_up;  // csize_up
+
+    GenerateMask100(mask, csize_up, c);
+
+    __bang_collect(top, top, mask, csize_up);
+    __bang_collect(left, left, mask, csize_up);
+  }
+
+  __bang_mul_scalar(left_top_index, top, src_w, size_up);
+  __bang_add(left_top_index, left_top_index, left, size_up);
+}
+
+__mlu_func__ void load_to_nram_pass_sram(void *nram_buf, void *ddr, void *sram_buf, int size) {
+  __sync_all();
+  if (clusterId == 0) {
+    __memcpy(sram_buf, ddr, size, GDRAM2SRAM);
+    if (clusterDim >= 2) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 1);
+    }
+    if (clusterDim >= 3) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 2);
+    }
+    if (clusterDim >= 4) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 3);
+    }
+    if (clusterDim >= 5) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 4);
+    }
+    if (clusterDim >= 6) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 5);
+    }
+    if (clusterDim >= 7) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 6);
+    }
+    if (clusterDim >= 8) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 7);
+    }
+  }
+  __sync_all();
+
+  __memcpy(nram_buf, sram_buf, size, SRAM2NRAM);
+}
+
+__mlu_func__ void load_to_sram(void *sram_buf, void *ddr, int size) {
+  __sync_all();
+  if (clusterId == 0) {
+    __memcpy(sram_buf, ddr, size, GDRAM2SRAM);
+    if (clusterDim >= 2) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 1);
+    }
+    if (clusterDim >= 3) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 2);
+    }
+    if (clusterDim >= 4) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 3);
+    }
+    if (clusterDim >= 5) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 4);
+    }
+    if (clusterDim >= 6) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 5);
+    }
+    if (clusterDim >= 7) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 6);
+    }
+    if (clusterDim >= 8) {
+      __memcpy(sram_buf, sram_buf, size, SRAM2SRAM, 7);
+    }
+  }
+  __sync_all();
+}
+
+template <typename T>
+__mlu_func__ void LoadSrc(T *src_inchip, T *sram_buf, T *src_ddr, int size, Location loc) {
+  switch (loc) {
+    case kNram: {
+      // load_to_nram_pass_sram(src_inchip, src_ddr, sram_buf, size);
+      if (taskDim > 1) {
+        load_to_nram_pass_sram(src_inchip, src_ddr, sram_buf, size);
+      } else {
+        __memcpy(src_inchip, src_ddr, size, GDRAM2NRAM);
+      }
+      break;
+    }
+
+    case kSram:
+      load_to_sram(sram_buf, src_ddr, size);
+      break;
+
+    case kGdram:
+      break;
+  }
+}
+
+template <typename T, typename DT>
+__mlu_func__ void spatialTransform(DT *dst_ddr,
+                                   DT *src_ddr,
+                                   float *mat_ddr,
+                                   float *multable_value_addr,
+                                   int dst_h,
+                                   int dst_w,
+                                   int src_h,
+                                   int src_w,
+                                   int c,
+                                   T *nram_buf,
+                                   DT *sram_buf) {
+  float *M = (float *)nram_buf;  // 128
+  __memcpy(M, mat_ddr, sizeof(float) * 6, GDRAM2NRAM);
+  M[0] = multable_value_addr[0];
+  M[4] = multable_value_addr[1];
+  float d_h = (float)dst_h;
+  float d_w = (float)dst_w;
+  float s_h = (float)src_h;
+  float s_w = (float)src_w;
+
+  float m0 = M[3];
+  float m1 = M[4];
+  float m2 = M[5];
+  float m3 = M[0];
+  float m4 = M[1];
+  float m5 = M[2];
+
+  M[0] = m0 * s_w / d_w;
+  M[1] = m1 * s_w / d_h;
+  M[2] = s_w * (m2 + 1 - m0 - m1) / 2;
+  M[3] = m3 * s_h / d_w;
+  M[4] = m4 * s_h / d_h;
+  M[5] = s_h * (m5 + 1 - m3 - m4) / 2;
+
+  int block_h = 1;
+  Location loc = kNram;
+  schedule(src_h, src_w, dst_h, dst_w, c, sizeof(DT), sizeof(T), &block_h, &loc);
+
+  int src_size = src_h * src_w * c;
+  int src_size_up = ALIGN_UP(src_size, 128);
+
+  // [smarsu size]: sizeof(DT) * src_size_up
+  DT *src_inchip = (DT *)(M + 128 / sizeof(float));  // src_size_up
+  LoadSrc(src_inchip, sram_buf, src_ddr, sizeof(DT) * src_size, loc);
+  int start, end;
+  segTask(dst_h, 1, &start, &end);
+  int h_size = end - start;
+
+  if (h_size > 0) {
+    nram_buf = (loc == kNram) ? (T *)(src_inchip + src_size_up) : (T *)src_inchip;
+
+    for (int h = start; h < end; h += block_h) {
+      int rh = MIN(block_h, end - h);
+
+      int hw_up = ALIGN_UP(rh * dst_w, ALIGN_NUM);
+      int chw_up = hw_up * c;
+
+      // [smarsu size]: 4 * chw_up + hw_up
+      T *left_w = nram_buf;                   // chw_up
+      T *right_w = left_w + chw_up;           // chw_up
+      T *top_w = right_w + chw_up;            // chw_up
+      T *bottom_w = top_w + chw_up;           // chw_up
+      T *left_top_index = bottom_w + chw_up;  // hw_up
+
+      // [smarsu size]
+      // level1: 4 * size_up * c + 2 * h * w_up * c + ALIGN_NUM
+      // level2: 2 * size_up + ALIGN_NUM
+      // level3: 4 * size_up * c + ALIGN_NUM + size_up * 2 * c
+      PrepareWeight(left_w, right_w, top_w, bottom_w, left_top_index, M, h, rh, dst_w, src_h, src_w,
+                    c, left_top_index + hw_up);
+
+      // [smarsu size]: 4 * chw_up
+      T *left_top = left_top_index + hw_up;    // chw_up
+      T *right_top = left_top + chw_up;        // chw_up
+      T *left_bottom = right_top + chw_up;     // chw_up
+      T *right_bottom = left_bottom + chw_up;  // chw_up
+
+      // [smarsu size]: sizeof(DT) * 4 * chw_up + 6 * chw_up + ALIGN_NUM
+      Remap(left_top, right_top, left_bottom, right_bottom, left_top_index, rh * dst_w,
+            src_h * src_w, src_w, c, right_bottom + chw_up, src_ddr, sram_buf, src_inchip, loc);
+
+      int hwc_up = ALIGN_UP(rh * dst_w * c, ALIGN_NUM);
+
+      __bang_mul(left_top, left_top, left_w, hwc_up);
+      __bang_mul(right_top, right_top, right_w, hwc_up);
+      __bang_add(left_top, left_top, right_top, hwc_up);
+      __bang_mul(left_top, left_top, top_w, hwc_up);
+
+      __bang_mul(left_bottom, left_bottom, left_w, hwc_up);
+      __bang_mul(right_bottom, right_bottom, right_w, hwc_up);
+      __bang_add(left_bottom, left_bottom, right_bottom, hwc_up);
+      __bang_mul(left_bottom, left_bottom, bottom_w, hwc_up);
+
+      __bang_add(left_top, left_top, left_bottom, hwc_up);
+
+      f2h((DT *)left_bottom, (T *)left_top, hwc_up);
+      __memcpy((DT *)dst_ddr + h * dst_w * c, (DT *)left_bottom, sizeof(DT) * rh * dst_w * c,
+               NRAM2GDRAM);
+    }
+  }
+}
+
+__mlu_entry__ void MLUSpatialTransformKernel(void *dst_ddr,
+                                             void *src_ddr,
+                                             void *mat_ddr,
+                                             void *multable_value,
+                                             int batch_size,
+                                             int dst_h,
+                                             int dst_w,
+                                             int src_h,
+                                             int src_w,
+                                             int c,
+                                             int data_type,
+                                             int cal_type,
+                                             int mat_no_broadcast) {
+  __nram__ int8_t nram_buf[NRAM_BUF_SIZE];
+  __mlu_shared__ int8_t sram_buf[SRAM_BUF_SIZE];
+
+  int src_size = src_h * src_w * c;
+  int dst_size = dst_h * dst_w * c;
+  for (int batch_idx = 0; batch_idx < batch_size; batch_idx++) {
+    spatialTransform((half *)dst_ddr + batch_idx * dst_size, (half *)src_ddr + batch_idx * src_size,
+                     (float *)mat_ddr + batch_idx * 6 * mat_no_broadcast,
+                     (float *)multable_value + batch_idx * 2, dst_h, dst_w, src_h, src_w, c,
+                     (float *)nram_buf, (half *)sram_buf);
+  }
+}
+
+static int PolicyFunc(cnrtDim3_t *k_dim, cnrtFunctionType_t *ktype) {
+  // Get device info and user-determined task info
+  CNdev mlu_dev;
+  CNcontext drv_ctx;
+  CNctxConfigParam ctx_conf_param;
+  int32_t visible_cluster_count = 0;
+  int32_t core_num_per_cluster = 0;
+
+  if (CN_SUCCESS != cnCtxGetDevice(&mlu_dev)) {
+    printf("[SpatialTransformEnqueue] Get mlu device type in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS != cnDeviceGetAttribute(&core_num_per_cluster,
+                                         CN_DEVICE_ATTRIBUTE_MAX_CORE_COUNT_PER_CLUSTER, mlu_dev)) {
+    printf(
+        "[SpatialTransformEnqueue] Get mlu device max core count per cluster in PolicyFunc "
+        "failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS != cnCtxGetCurrent(&drv_ctx)) {
+    printf("[SpatialTransformEnqueue] Get mlu drv context in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  if (CN_SUCCESS !=
+      cnGetCtxConfigParam(drv_ctx, CN_CTX_CONFIG_VISIBLE_CLUSTER_NUM, &ctx_conf_param)) {
+    printf("[SpatialTransformEnqueue] Get mlu drv visible cluster num in PolicyFunc failed.\n");
+    return -1;
+  }
+
+  // Maybe helpful but not used.
+  // int32_t max_cluster_count = 0;
+  // if (CN_SUCCESS !=
+  //     cnDeviceGetAttribute(&max_cluster_count, CN_DEVICE_ATTRIBUTE_MAX_CLUSTER_COUNT, mlu_dev)) {
+  //   printf("[SpatialTransformEnqueue] Get mlu device cluster num in PolicyFunc failed.\n");
+  //   return -1;
+  // }
+
+  visible_cluster_count = ctx_conf_param.visibleClusterNumber;
+  int dim_y_tmp = 1;
+  cnrtFunctionType_t ktype_tmp = CNRT_FUNC_TYPE_UNION2;
+  if (core_num_per_cluster == 1 || core_num_per_cluster == 4) {
+    dim_y_tmp = 2;
+    ktype_tmp = CNRT_FUNC_TYPE_UNION1;
+  }
+
+  // Determin policy function
+  switch (visible_cluster_count) {
+    case 0: {
+      k_dim->x = 1;
+      k_dim->y = 1;
+      k_dim->z = 1;
+      *ktype = cnrtFuncTypeBlock;
+    }; break;
+    case 1: {
+      k_dim->x = core_num_per_cluster;
+      k_dim->y = 1;
+      k_dim->z = 1;
+      *ktype = cnrtFuncTypeUnion1;
+    }; break;
+    case 2: {
+      k_dim->x = core_num_per_cluster;
+      k_dim->y = dim_y_tmp;
+      k_dim->z = 1;
+      *ktype = ktype_tmp;
+    }; break;
+    case 4: {
+      k_dim->x = 16;
+      k_dim->y = 1;
+      k_dim->z = 1;
+      *ktype = cnrtFuncTypeUnion4;
+    }; break;
+    case 6: {
+      k_dim->x = 16;
+      k_dim->y = 1;
+      k_dim->z = 1;
+      *ktype = cnrtFuncTypeUnion4;
+    }; break;
+    case 8: {
+      k_dim->x = 32;
+      k_dim->y = 1;
+      k_dim->z = 1;
+      *ktype = cnrtFuncTypeUnion8;
+    }; break;
+    default: {
+      printf("[SpatialTransformEnqueue] Failed to choose kernel to launch.\n");
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+void SpatialTransformEnqueue(cnrtQueue_t queue,
+                             void *dst_ddr,
+                             void *src_ddr,
+                             void *mat_ddr,
+                             void *multable_value,
+                             int batch_size,
+                             int dst_h,
+                             int dst_w,
+                             int src_h,
+                             int src_w,
+                             int c,
+                             int data_type,
+                             int cal_type,
+                             int mat_no_broadcast) {
+  cnrtDim3_t dim;
+  cnrtFunctionType_t ktype;
+  if (PolicyFunc(&dim, &ktype)) {
+    printf("[SpatialTransformEnqueue] PolicyFunc run failed.\n");
+    return;
+  }
+
+  MLUSpatialTransformKernel<<<dim, ktype, queue>>>(dst_ddr, src_ddr, mat_ddr, multable_value,
+                                                   batch_size, dst_h, dst_w, src_h, src_w, c,
+                                                   data_type, cal_type, mat_no_broadcast);
+}

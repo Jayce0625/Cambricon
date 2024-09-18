@@ -1,0 +1,20 @@
+# Copyright (C) [2020-2023] The Cambricon Authors. All Rights Reserved.   
+# model configuration for caffe.
+
+resnet50:
+  resize_size: [256, 256]
+  center_crop_size: [224, 224]
+  need_bgr2rgb: True
+  need_transpose: True 
+  need_normalize: True
+  mean: [0.485,0.456,0.406]
+  std: [0.229,0.224,0.225]
+
+vgg16:
+  resize_size: [256, 256]
+  center_crop_size: [224, 224]
+  need_bgr2rgb: True
+  need_transpose: True 
+  need_normalize: True
+  mean: [0.485,0.456,0.406]
+  std: [0.229,0.224,0.225]
